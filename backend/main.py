@@ -8,6 +8,8 @@ import sentry_sdk
 from schemas import CreateJobRequest, JobResponse
 from models import Job
 from database import get_db
+from arq import create_pool
+from arq.connections import RedisSettings
 
 sentry_sdk.init(
     dsn=settings.sentry_dsn,
@@ -17,7 +19,7 @@ sentry_sdk.init(
 )
 
 redis_client = redis.Redis.from_url(settings.redis_url)
-
+REDIS_SETTINGS = RedisSettings(host="localhost", port=6379)
 
 setup_logging()
 app = FastAPI()
@@ -47,11 +49,16 @@ def health(db=Depends(get_db)):
     return result
 
 @app.post("/jobs", response_model=JobResponse)
-def create_job(request: CreateJobRequest, db: Session = Depends(get_db)):
+async def create_job(request: CreateJobRequest, db: Session = Depends(get_db)):
     job = Job(filename=request.filename)
     db.add(job)
     db.commit()
     db.refresh(job)
+
+    redis = await create_pool(REDIS_SETTINGS)
+    await redis.enqueue_job("process_document", str(job.id), request.filename)
+    await redis.close()
+    
     log.info("job.created", job_id=str(job.id),
     filename=job.filename)
     return job
