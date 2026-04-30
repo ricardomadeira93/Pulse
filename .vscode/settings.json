@@ -1,4 +1,10 @@
 {
     "python-envs.defaultEnvManager": "ms-python.python:venv",
-    "python.defaultInterpreterPath": "${workspaceFolder}/backend/.venv/bin/python"
+    "python.defaultInterpreterPath": "${workspaceFolder}/backend/.venv/bin/python",
+    "[typescriptreact]": {
+        "editor.defaultFormatter": "dbaeumer.vscode-eslint"
+    },
+    "[typescript]": {
+        "editor.defaultFormatter": "dbaeumer.vscode-eslint"
+    }
 }
