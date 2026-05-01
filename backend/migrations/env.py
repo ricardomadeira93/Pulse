@@ -2,13 +2,12 @@ import os
 import sys
 from logging.config import fileConfig
 
-from sqlalchemy import engine_from_config, pool
+from sqlalchemy import create_engine, pool
 from alembic import context
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from config import settings
-from database import Base
+from base import Base
 import models  # noqa: F401
 
 # this is the Alembic Config object, which provides
@@ -18,7 +17,27 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-config.set_main_option("sqlalchemy.url", settings.database_url)
+
+def get_database_url() -> str:
+    if database_url := os.getenv("DATABASE_URL"):
+        return database_url
+
+    env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
+    if os.path.exists(env_path):
+        with open(env_path, "r", encoding="utf-8") as env_file:
+            for raw_line in env_file:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+
+                key, value = line.split("=", 1)
+                if key.strip() == "DATABASE_URL":
+                    return value.strip().strip('"').strip("'")
+
+    raise RuntimeError("DATABASE_URL is not set for Alembic.")
+
+
+config.set_main_option("sqlalchemy.url", get_database_url())
 target_metadata = Base.metadata
 
 # other values from the config, defined by the needs of env.py,
@@ -58,10 +77,15 @@ def run_migrations_online() -> None:
     and associate a connection with the context.
 
     """
-    connectable = engine_from_config(
-        config.get_section(config.config_ini_section, {}),
-        prefix="sqlalchemy.",
+    database_url = config.get_main_option("sqlalchemy.url")
+    connect_args = {}
+    if database_url.startswith("postgresql://"):
+        connect_args["connect_timeout"] = 5
+
+    connectable = create_engine(
+        database_url,
         poolclass=pool.NullPool,
+        connect_args=connect_args,
     )
 
     with connectable.connect() as connection:

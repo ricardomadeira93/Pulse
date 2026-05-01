@@ -1,24 +1,23 @@
 import asyncio
-import json
+import time
+import uuid
 from contextlib import asynccontextmanager
-from urllib.parse import urlparse
 
-import redis
-import redis.asyncio as aioredis
 import sentry_sdk
-from arq import create_pool
-from arq.connections import RedisSettings
-from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import text
-from sqlalchemy.orm import Session
+from fastapi.responses import Response
 
 from config import settings
 from connection_manager import manager
-from database import get_db
 from logger import setup_logging, log
-from models import Job
-from schemas import CreateJobRequest, JobResponse
+from routers.health import router as health_router
+from routers.jobs import router as jobs_router
+from routers.websocket import router as websocket_router
+from services.realtime import redis_listener
+
+# Startup and app configuration
+setup_logging(service="backend", env=settings.env)
 
 sentry_sdk.init(
     dsn=settings.sentry_dsn,
@@ -27,39 +26,55 @@ sentry_sdk.init(
     send_default_pii=True,
 )
 
-redis_client = redis.Redis.from_url(settings.redis_url)
-redis_url = urlparse(settings.redis_url)
-REDIS_SETTINGS = RedisSettings(
-    host=redis_url.hostname or "localhost",
-    port=redis_url.port or 6379,
-)
-setup_logging()
-
-async def redis_listener():
-    r = aioredis.Redis.from_url(settings.redis_url)
-    pubsub = r.pubsub()
-    await pubsub.psubscribe("job:*")
-    log.info("redis.listener.started")
-    async for message in pubsub.listen():
-        if message["type"] != "pmessage":
-            continue
-
-        try:
-            data = json.loads(message["data"])
-            job_id = data.get("job_id")
-            if job_id:
-                await manager.send_update(job_id, data)
-        except Exception as e:
-            log.error("redis.listener.error", error=str(e))
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    asyncio.create_task(redis_listener())
+    listener_task = asyncio.create_task(redis_listener(manager))
     log.info("app.started")
-    yield
-    log.info("app.stopped")
+    try:
+        yield
+    finally:
+        listener_task.cancel()
+        try:
+            await listener_task
+        except asyncio.CancelledError:
+            pass
+        log.info("app.stopped")
+
 
 app = FastAPI(lifespan=lifespan)
+
+# Request logging middleware
+@app.middleware("http")
+async def log_requests(request: Request, call_next) -> Response:
+    request_id = str(uuid.uuid4())
+    start_time = time.perf_counter()
+
+    try:
+        response = await call_next(request)
+    except Exception:
+        duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
+        log.exception(
+            "http.request.failed",
+            request_id=request_id,
+            method=request.method,
+            path=request.url.path,
+            duration_ms=duration_ms,
+            client=request.client.host if request.client else None,
+        )
+        raise
+
+    duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
+    response.headers["X-Request-ID"] = request_id
+    log.info(
+        "http.request.completed",
+        request_id=request_id,
+        method=request.method,
+        path=request.url.path,
+        status_code=response.status_code,
+        duration_ms=duration_ms,
+        client=request.client.host if request.client else None,
+    )
+    return response
 
 app.add_middleware(
     CORSMiddleware,
@@ -69,64 +84,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-@app.get("/health")
-def health(db=Depends(get_db)):
-    result = {"status": "Ok", "database":"unknown", "redis": "unknown"}
-    try:
-        db.execute(text("Select 1"))
-        result["database"] = "ok"
-    except Exception as e:
-        result["database"] = "error"
-        result["status"] = "degraded"
-        log.error("health.database.error",
-    error=str(e))
-        
-    try:
-        redis_client.ping()
-        result["redis"] = "ok"
-    except Exception as e:
-        result["redis"] = "error"
-        result["status"] = "degraded"
-        log.error("health.redis.error",
-        error=str(e))    
-
-    return result
-
-@app.post("/jobs", response_model=JobResponse)
-async def create_job(request: CreateJobRequest, db: Session = Depends(get_db)):
-    job = Job(filename=request.filename)
-    db.add(job)
-    db.commit()
-    db.refresh(job)
-
-    redis = await create_pool(REDIS_SETTINGS)
-    await redis.enqueue_job("process_document", str(job.id), request.filename)
-    await redis.close()
-    
-    log.info("job.created", job_id=str(job.id),
-    filename=job.filename)
-    return job
-
-@app.get("/jobs", response_model=list[JobResponse])
-def list_jobs(db: Session = Depends(get_db)):    
-    jobs = db.query(Job).order_by(Job.created_at.desc()).all()
-    log.info("jobs.listed", count=len(jobs))
-    return jobs
-
-@app.get("/jobs/{job_id}", response_model=JobResponse)
-def get_job(job_id: str, db: Session = Depends(get_db)):
-    job = db.query(Job).filter(Job.id == job_id).first()
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    return job
-
-@app.websocket("/ws/{job_id}")
-async def websocket_endpoint(websocket: WebSocket, job_id:str):
-    await manager.connect(job_id, websocket)
-    try:
-        while True:
-            await websocket.receive_text()
-    except WebSocketDisconnect:
-        manager.disconnect(job_id)
-        log.info("websocket.client.disconnected", job_id=job_id)
+app.include_router(health_router)
+app.include_router(jobs_router)
+app.include_router(websocket_router)
